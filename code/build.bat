@@ -1,6 +1,6 @@
 @echo off
 
-mkdir ..\build
-pushd ..\build
-cl -Zi ..\code\win32_tedzukuri.cpp user32.lib
+mkdir D:\tedzukuri\build
+pushd D:\tedzukuri\build
+cl -Zi D:\tedzukuri\code\win32_tedzukuri.cpp user32.lib gdi32.lib
 popd
