@@ -1,58 +1,68 @@
 #include <windows.h>
-
+#include <stdint.h>
 // static here means that it is a global variable. this also defaults it to 0, no need to initialize it
 // TODO: global variable temporarily
 static bool running;
 static BITMAPINFO bitmapInfo;
 static void *bitmapMemory;
-static HBITMAP bitmapHandle;
-static HDC bitmapDeviceContext;
-// static keyword on a function means that they can only be called within this file
+static int bitmapWidth;
+static int bitmapHeight;
+static int bytesPerPixel = 4; // we NEED 3 bytes per pixel because of RGB (1 byte for red, 1 for green, 1 for blue) but we add an
+							  // extra one for padding, to ensure that all of our bytes are aligned on 4 bytes boundaries.
+							  // this is because if we are working on 32 bits (we are), bits need to be aligned on 32 bit boundaries
 
-static void
-resizeDIBSection(int width, int height)
+// static keyword on a function means that they can only be called within this file
+static void render(int xOffset, int yOffset)
+{
+	int pitch = bitmapWidth * bytesPerPixel; // difference between a row and the next row
+	uint8_t *row = (uint8_t *)bitmapMemory;
+	for (int y = 0; y < bitmapHeight; ++y)
+	{
+		uint32_t *pixel = (uint32_t *)row;
+		for (int x = 0; x < bitmapWidth; ++x)
+		{
+			uint8_t green = (y + yOffset);
+			uint8_t blue = (x + xOffset);
+
+			*pixel++ = (green << 8 | blue);
+		}
+		row += pitch;
+	}
+}
+static void resizeDIBSection(int width, int height)
 {
 	// TODO: dont free automatically, maybe free after, then free first if that fails
 
-	if (bitmapHandle)
+	if (bitmapMemory)
 	{
-		DeleteObject(bitmapHandle);
-	}
-	if (!bitmapDeviceContext)
-	{
-		bitmapDeviceContext = CreateCompatibleDC(0);
+		VirtualFree(bitmapMemory, 0, MEM_RELEASE);
 	}
 
+	bitmapWidth = width;
+	bitmapHeight = height;
+
 	bitmapInfo.bmiHeader.biSize = sizeof(bitmapInfo.bmiHeader);
-	bitmapInfo.bmiHeader.biWidth = width;
-	bitmapInfo.bmiHeader.biHeight = height;
+	bitmapInfo.bmiHeader.biWidth = bitmapWidth;
+	bitmapInfo.bmiHeader.biHeight = -bitmapHeight; //??
 	bitmapInfo.bmiHeader.biPlanes = 1;
 	bitmapInfo.bmiHeader.biBitCount = 32;
 	bitmapInfo.bmiHeader.biCompression = BI_RGB;
 
-	bitmapHandle = CreateDIBSection(
-		bitmapDeviceContext,
-		&bitmapInfo,
-		DIB_RGB_COLORS,
-		&bitmapMemory,
-		0,
-		0);
+	int bitmapMemorySize = (width * height) * bytesPerPixel; // we need enough bits for the area of the rectangle multiplied by 4 (see above why 4)
+	bitmapMemory = VirtualAlloc(0, bitmapMemorySize, MEM_COMMIT, PAGE_READWRITE);
 }
 
-static void windowUpdate(HDC deviceContext, int x, int y, int width, int height)
+static void windowUpdate(HDC deviceContext, RECT *clientRect, int x, int y, int width, int height)
 {
+	int windowWidth = clientRect->right - clientRect->left;
+	int windowHeight = clientRect->bottom - clientRect->top;
+
 	StretchDIBits(
 		deviceContext,
 		// window we are drawing to:
-		x,
-		y,
-		width,
-		height,
+		0, 0, bitmapWidth, bitmapHeight,
 		// window we are drawing from:
-		x,
-		y,
-		width,
-		height,
+		0, 0, windowWidth, windowHeight,
 		bitmapMemory,
 		&bitmapInfo,
 		DIB_RGB_COLORS,
@@ -73,11 +83,15 @@ LRESULT CALLBACK windowCallback(
 	{
 		PAINTSTRUCT paint;
 		HDC deviceContext = BeginPaint(windowHandle, &paint);
+
+		RECT clientRect;
+		GetClientRect(windowHandle, &clientRect);
+
 		int x = paint.rcPaint.left;
 		int y = paint.rcPaint.top;
 		int height = paint.rcPaint.bottom - paint.rcPaint.top;
 		int width = paint.rcPaint.right - paint.rcPaint.left;
-		windowUpdate(deviceContext, x, y, width, height);
+		windowUpdate(deviceContext, &clientRect, x, y, width, height);
 		EndPaint(windowHandle, &paint);
 	}
 	break;
@@ -148,20 +162,32 @@ int CALLBACK WinMain(
 
 		if (windowHandle)
 		{
+			int xOffset = 0;
+			int yOffset = 0;
 			running = true;
-			MSG message;
 			while (running)
 			{
-				BOOL messageResult = GetMessage(&message, 0, 0, 0);
-				if (messageResult > 0)
+				MSG message;
+				while (PeekMessage(&message, 0, 0, 0, PM_REMOVE))
 				{
+					if (message.message == WM_QUIT)
+					{
+						running = false;
+					}
 					TranslateMessage(&message);
 					DispatchMessage(&message);
 				}
-				else
-				{
-					break;
-				}
+				render(xOffset, yOffset);
+
+				HDC deviceContext = GetDC(windowHandle);
+				RECT clientRect;
+				GetClientRect(windowHandle, &clientRect);
+				int windowHeight = clientRect.bottom - clientRect.top;
+				int windowWidth = clientRect.right - clientRect.left;
+
+				windowUpdate(deviceContext, &clientRect, 0, 0, windowWidth, windowHeight);
+				ReleaseDC(windowHandle, deviceContext);
+				++xOffset;
 			}
 		}
 		else
