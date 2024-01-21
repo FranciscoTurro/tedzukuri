@@ -1,70 +1,88 @@
 #include <windows.h>
 #include <stdint.h>
-// static here means that it is a global variable. this also defaults it to 0, no need to initialize it
-// TODO: global variable temporarily
-static bool running;
-static BITMAPINFO bitmapInfo;
-static void *bitmapMemory;
-static int bitmapWidth;
-static int bitmapHeight;
-static int bytesPerPixel = 4; // we NEED 3 bytes per pixel because of RGB (1 byte for red, 1 for green, 1 for blue) but we add an
-							  // extra one for padding, to ensure that all of our bytes are aligned on 4 bytes boundaries.
-							  // this is because if we are working on 32 bits (we are), bits need to be aligned on 32 bit boundaries
-
-// static keyword on a function means that they can only be called within this file
-static void render(int xOffset, int yOffset)
+struct offscreenBuffer
 {
-	int pitch = bitmapWidth * bytesPerPixel; // difference between a row and the next row
-	uint8_t *row = (uint8_t *)bitmapMemory;
-	for (int y = 0; y < bitmapHeight; ++y)
+	BITMAPINFO info;
+	void *memory;
+	int width;
+	int height;
+	int pitch;
+	int bytesPerPixel; // we NEED 3 bytes per pixel, 1 byte for red, 1 for green, 1 for blue but we add an
+					   // extra one for padding, to ensure that all of our bytes are aligned on 4 bytes boundaries.
+					   // this is because if we are working on 32 bits (we are), bits need to be aligned on 32 bit boundaries
+};
+struct windowDimensions
+{
+	int width;
+	int height;
+};
+
+static bool running;
+static offscreenBuffer globalBackbuffer;
+
+windowDimensions getWindowDimensions(HWND windowHandle)
+{
+	RECT clientRect;
+	GetClientRect(windowHandle, &clientRect);
+
+	windowDimensions result;
+	result.height = clientRect.bottom - clientRect.top;
+	result.width = clientRect.right - clientRect.left;
+
+	return result;
+}
+static void render(offscreenBuffer buffer, int blueOffset, int greenOffset)
+{
+	uint8_t *row = (uint8_t *)buffer.memory;
+	for (int y = 0; y < buffer.height; ++y)
 	{
 		uint32_t *pixel = (uint32_t *)row;
-		for (int x = 0; x < bitmapWidth; ++x)
+		for (int x = 0; x < buffer.width; ++x)
 		{
-			uint8_t green = (y + yOffset);
-			uint8_t blue = (x + xOffset);
+			uint8_t blue = (x + blueOffset);
+			uint8_t green = (y + greenOffset);
 
 			*pixel++ = (green << 8 | blue);
 		}
-		row += pitch;
+		row += buffer.pitch;
 	}
 }
-static void resizeDIBSection(int width, int height)
+static void resizeDIBSection(offscreenBuffer *buffer, int width, int height)
 {
 	// TODO: dont free automatically, maybe free after, then free first if that fails
 
-	if (bitmapMemory)
+	if (buffer->memory)
 	{
-		VirtualFree(bitmapMemory, 0, MEM_RELEASE);
+		VirtualFree(buffer->memory, 0, MEM_RELEASE);
 	}
 
-	bitmapWidth = width;
-	bitmapHeight = height;
+	buffer->width = width;
+	buffer->height = height;
+	buffer->bytesPerPixel = 4;
 
-	bitmapInfo.bmiHeader.biSize = sizeof(bitmapInfo.bmiHeader);
-	bitmapInfo.bmiHeader.biWidth = bitmapWidth;
-	bitmapInfo.bmiHeader.biHeight = -bitmapHeight; //??
-	bitmapInfo.bmiHeader.biPlanes = 1;
-	bitmapInfo.bmiHeader.biBitCount = 32;
-	bitmapInfo.bmiHeader.biCompression = BI_RGB;
+	buffer->info.bmiHeader.biSize = sizeof(buffer->info.bmiHeader);
+	buffer->info.bmiHeader.biWidth = buffer->width;
+	buffer->info.bmiHeader.biHeight = -buffer->height; // negative ??
+	buffer->info.bmiHeader.biPlanes = 1;
+	buffer->info.bmiHeader.biBitCount = 32;
+	buffer->info.bmiHeader.biCompression = BI_RGB;
 
-	int bitmapMemorySize = (width * height) * bytesPerPixel; // we need enough bits for the area of the rectangle multiplied by 4 (see above why 4)
-	bitmapMemory = VirtualAlloc(0, bitmapMemorySize, MEM_COMMIT, PAGE_READWRITE);
+	int bitmapMemorySize = (buffer->width * buffer->height) * buffer->bytesPerPixel; // we need enough bits for the area of the rectangle multiplied by 4
+	buffer->memory = VirtualAlloc(0, bitmapMemorySize, MEM_COMMIT, PAGE_READWRITE);
+
+	buffer->pitch = buffer->width * buffer->bytesPerPixel; // number of bytes in a row of the bitmap
 }
-
-static void windowUpdate(HDC deviceContext, RECT *clientRect, int x, int y, int width, int height)
+static void displayBufferInWindow(HDC deviceContext, int width, int height, offscreenBuffer buffer, int x, int y)
 {
-	int windowWidth = clientRect->right - clientRect->left;
-	int windowHeight = clientRect->bottom - clientRect->top;
-
+	// TODO: aspect ratio correction
 	StretchDIBits(
 		deviceContext,
 		// window we are drawing to:
-		0, 0, bitmapWidth, bitmapHeight,
+		0, 0, width, height,
 		// window we are drawing from:
-		0, 0, windowWidth, windowHeight,
-		bitmapMemory,
-		&bitmapInfo,
+		0, 0, buffer.width, buffer.height,
+		buffer.memory,
+		&buffer.info,
 		DIB_RGB_COLORS,
 		SRCCOPY);
 }
@@ -84,24 +102,16 @@ LRESULT CALLBACK windowCallback(
 		PAINTSTRUCT paint;
 		HDC deviceContext = BeginPaint(windowHandle, &paint);
 
-		RECT clientRect;
-		GetClientRect(windowHandle, &clientRect);
+		windowDimensions dimensions = getWindowDimensions(windowHandle);
 
 		int x = paint.rcPaint.left;
 		int y = paint.rcPaint.top;
-		int height = paint.rcPaint.bottom - paint.rcPaint.top;
-		int width = paint.rcPaint.right - paint.rcPaint.left;
-		windowUpdate(deviceContext, &clientRect, x, y, width, height);
+		displayBufferInWindow(deviceContext, dimensions.width, dimensions.height, globalBackbuffer, x, y);
 		EndPaint(windowHandle, &paint);
 	}
 	break;
 	case WM_SIZE:
 	{
-		RECT clientRect;
-		GetClientRect(windowHandle, &clientRect);
-		int height = clientRect.bottom - clientRect.top;
-		int width = clientRect.right - clientRect.left;
-		resizeDIBSection(width, height);
 	}
 	break;
 	case WM_DESTROY:
@@ -138,8 +148,11 @@ int CALLBACK WinMain(
 	PSTR cmdline,
 	int cmdshow)
 {
-	WNDCLASSA windowClass{};
-	windowClass.style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW;
+	WNDCLASSA windowClass = {};
+
+	resizeDIBSection(&globalBackbuffer, 1280, 720);
+
+	windowClass.style = CS_HREDRAW | CS_VREDRAW;
 	windowClass.lpfnWndProc = windowCallback;
 	windowClass.hInstance = instance;
 	windowClass.lpszClassName = "TedzukuriWindowClass";
@@ -168,7 +181,7 @@ int CALLBACK WinMain(
 			while (running)
 			{
 				MSG message;
-				while (PeekMessage(&message, 0, 0, 0, PM_REMOVE))
+				while (PeekMessageA(&message, 0, 0, 0, PM_REMOVE))
 				{
 					if (message.message == WM_QUIT)
 					{
@@ -177,15 +190,13 @@ int CALLBACK WinMain(
 					TranslateMessage(&message);
 					DispatchMessage(&message);
 				}
-				render(xOffset, yOffset);
+				render(globalBackbuffer, xOffset, yOffset);
 
 				HDC deviceContext = GetDC(windowHandle);
-				RECT clientRect;
-				GetClientRect(windowHandle, &clientRect);
-				int windowHeight = clientRect.bottom - clientRect.top;
-				int windowWidth = clientRect.right - clientRect.left;
 
-				windowUpdate(deviceContext, &clientRect, 0, 0, windowWidth, windowHeight);
+				windowDimensions dimensions = getWindowDimensions(windowHandle);
+
+				displayBufferInWindow(deviceContext, dimensions.width, dimensions.height, globalBackbuffer, 0, 0);
 				ReleaseDC(windowHandle, deviceContext);
 				++xOffset;
 			}
