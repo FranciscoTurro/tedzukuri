@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <stdint.h>
 #include <dsound.h>
+#include <string>
 struct offscreenBuffer
 {
 	BITMAPINFO info;
@@ -18,10 +19,12 @@ struct windowDimensions
 	int height;
 };
 
-static bool running;
-static offscreenBuffer globalBackbuffer;
+static bool globalRunningFlag;
+static offscreenBuffer globalBitmapBackbuffer;
+static LPDIRECTSOUNDBUFFER globalSecondaryAudioBuffer;
 
-static void initDirectSound(HWND windowHandle, int32_t bufferSize, int32_t samplesPerSecond) // NOTE: I AM making it mandatory to have the library in order to run the program, handmade hero doesnt
+static void
+initDirectSound(HWND windowHandle, int32_t bufferSize, int32_t samplesPerSecond) // NOTE: I AM making it mandatory to have the library in order to run the program, handmade hero doesnt
 {
 	LPDIRECTSOUND directSound;
 
@@ -42,10 +45,10 @@ static void initDirectSound(HWND windowHandle, int32_t bufferSize, int32_t sampl
 			bufferDescription.dwSize = sizeof(bufferDescription);
 			bufferDescription.dwFlags = DSBCAPS_PRIMARYBUFFER;
 
-			LPDIRECTSOUNDBUFFER primaryBuffer;
-			if (SUCCEEDED(directSound->CreateSoundBuffer(&bufferDescription, &primaryBuffer, 0)))
+			LPDIRECTSOUNDBUFFER primaryAudioBuffer;
+			if (SUCCEEDED(directSound->CreateSoundBuffer(&bufferDescription, &primaryAudioBuffer, 0)))
 			{
-				if (SUCCEEDED(primaryBuffer->SetFormat(&waveFormat)))
+				if (SUCCEEDED(primaryAudioBuffer->SetFormat(&waveFormat)))
 				{
 					OutputDebugStringA("Set primary buffer format\n");
 				}
@@ -69,8 +72,7 @@ static void initDirectSound(HWND windowHandle, int32_t bufferSize, int32_t sampl
 		bufferDescription.dwBufferBytes = bufferSize;
 		bufferDescription.lpwfxFormat = &waveFormat;
 
-		LPDIRECTSOUNDBUFFER secondaryBuffer;
-		if (SUCCEEDED(directSound->CreateSoundBuffer(&bufferDescription, &secondaryBuffer, 0)))
+		if (SUCCEEDED(directSound->CreateSoundBuffer(&bufferDescription, &globalSecondaryAudioBuffer, 0)))
 		{
 			OutputDebugStringA("Secondary buffer created\n");
 		}
@@ -209,7 +211,7 @@ LRESULT CALLBACK windowCallback(
 		bool altKeyWasDown = ((lParam & (1 << 29)) != 0);
 		if (virtualKeyCode == VK_F4 && altKeyWasDown)
 		{
-			running = false;
+			globalRunningFlag = false;
 		}
 	}
 	break;
@@ -222,7 +224,7 @@ LRESULT CALLBACK windowCallback(
 
 		int x = paint.rcPaint.left;
 		int y = paint.rcPaint.top;
-		displayBufferInWindow(deviceContext, dimensions.width, dimensions.height, &globalBackbuffer, x, y);
+		displayBufferInWindow(deviceContext, dimensions.width, dimensions.height, &globalBitmapBackbuffer, x, y);
 		EndPaint(windowHandle, &paint);
 	}
 	break;
@@ -238,7 +240,7 @@ LRESULT CALLBACK windowCallback(
 	break;
 	case WM_CLOSE:
 	{
-		running = false;
+		globalRunningFlag = false;
 		OutputDebugStringA("WM_CLOSE\n");
 		// TODO: window pop-up "are you sure you want to close the application?"
 	}
@@ -266,7 +268,7 @@ int CALLBACK WinMain(
 {
 	WNDCLASSA windowClass = {};
 
-	resizeDIBSection(&globalBackbuffer, 1280, 720);
+	resizeDIBSection(&globalBitmapBackbuffer, 1280, 720);
 
 	windowClass.style = CS_HREDRAW | CS_VREDRAW;
 	windowClass.lpfnWndProc = windowCallback;
@@ -291,32 +293,113 @@ int CALLBACK WinMain(
 
 		if (windowHandle)
 		{
+			HDC deviceContext = GetDC(windowHandle);
+
 			int xOffset = 0;
 			int yOffset = 0;
 
-			initDirectSound(windowHandle, 48000, 48000 * (sizeof(int16_t) * 2));
+			int samplesPerSecond = 48000;
+			int toneHz = 256;
+			int squareWavePeriod = samplesPerSecond / toneHz;
+			int bytesPerSample = sizeof(int16_t) * 2;
+			uint32_t runningSampleIndex = 0;
+			int halfWaveSquarePeriod = squareWavePeriod / 2;
+			int secondaryBufferSize = samplesPerSecond * bytesPerSample;
+			int toneVolume = 500;
 
-			running = true;
-			while (running)
+			initDirectSound(windowHandle, samplesPerSecond, samplesPerSecond * (sizeof(int16_t) * 2));
+
+			globalSecondaryAudioBuffer->Play(0, 0, DSBPLAY_LOOPING);
+
+			globalRunningFlag = true;
+			while (globalRunningFlag)
 			{
 				MSG message;
 				while (PeekMessageA(&message, 0, 0, 0, PM_REMOVE))
 				{
 					if (message.message == WM_QUIT)
 					{
-						running = false;
+						globalRunningFlag = false;
 					}
 					TranslateMessage(&message);
 					DispatchMessage(&message);
 				}
-				render(&globalBackbuffer, xOffset, yOffset);
+				render(&globalBitmapBackbuffer, xOffset, yOffset);
 
-				HDC deviceContext = GetDC(windowHandle);
+				// AUDIO
+
+				DWORD playCursor;
+				DWORD writeCursor;
+
+				if (SUCCEEDED(globalSecondaryAudioBuffer->GetCurrentPosition(&playCursor, &writeCursor)))
+				{
+					DWORD bytesToWrite;
+					DWORD byteToLock = runningSampleIndex * bytesPerSample % secondaryBufferSize;
+					if (byteToLock == playCursor)
+					{
+						bytesToWrite = secondaryBufferSize;
+					}
+					if (byteToLock > playCursor)
+					{
+						bytesToWrite = secondaryBufferSize - byteToLock;
+						bytesToWrite += playCursor;
+					}
+					else
+					{
+						bytesToWrite = playCursor - byteToLock;
+					}
+
+					void *region1;
+					DWORD region1Size;
+					void *region2;
+					DWORD region2Size;
+
+					HRESULT lockResult = globalSecondaryAudioBuffer->Lock(byteToLock, bytesToWrite,
+																		  &region1, &region1Size,
+																		  &region2, &region2Size,
+																		  0);
+					if (SUCCEEDED(lockResult))
+					{
+
+						int16_t *sampleOut = (int16_t *)region1;
+						DWORD region1SampleCount = region1Size / bytesPerSample;
+
+						for (DWORD sampleIndex = 0; sampleIndex < region1SampleCount; ++sampleIndex)
+						{
+							int16_t sampleValue = ((runningSampleIndex / halfWaveSquarePeriod) % 2) ? toneVolume : -toneVolume;
+							*sampleOut++ = sampleValue;
+							*sampleOut++ = sampleValue;
+							++runningSampleIndex;
+						}
+						sampleOut = (int16_t *)region2;
+						DWORD region2SampleCount = region2Size / bytesPerSample;
+
+						for (DWORD sampleIndex = 0; sampleIndex < region2SampleCount; ++sampleIndex)
+						{
+							int16_t sampleValue = ((runningSampleIndex / halfWaveSquarePeriod) % 2) ? toneVolume : -toneVolume;
+							*sampleOut++ = sampleValue;
+							*sampleOut++ = sampleValue;
+							++runningSampleIndex;
+						}
+						globalSecondaryAudioBuffer->Unlock(region1, region1Size, region2, region2Size);
+					}
+					else
+					{
+						OutputDebugStringA("Lock failed with HRESULT: ");
+						OutputDebugStringA(std::to_string(lockResult).c_str());
+						OutputDebugStringA("\n");
+					}
+				}
+				else
+				{
+					OutputDebugStringA("GetCurrentPosition failed\n");
+				}
 
 				windowDimensions dimensions = getWindowDimensions(windowHandle);
+				displayBufferInWindow(deviceContext, dimensions.width, dimensions.height, &globalBitmapBackbuffer, 0, 0);
 
-				displayBufferInWindow(deviceContext, dimensions.width, dimensions.height, &globalBackbuffer, 0, 0);
 				ReleaseDC(windowHandle, deviceContext);
+
 				++xOffset;
 			}
 		}
