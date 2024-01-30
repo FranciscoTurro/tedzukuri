@@ -2,7 +2,11 @@
 #include <stdint.h>
 #include <dsound.h>
 #include <string>
-struct offscreenBuffer
+#include <math.h>
+
+#define pi32 3.14159265359f
+
+struct OffscreenBuffer
 {
 	BITMAPINFO info;
 	void *memory;
@@ -13,18 +17,27 @@ struct offscreenBuffer
 					   // extra one for padding, to ensure that all of our bytes are aligned on 4 bytes boundaries.
 					   // this is because if we are working on 32 bits (we are), bits need to be aligned on 32 bit boundaries
 };
-struct windowDimensions
+struct WindowDimensions
 {
 	int width;
 	int height;
 };
+struct SoundOutput
+{
+	int samplesPerSecond;
+	int toneHz;
+	int wavePeriod;
+	int bytesPerSample;
+	uint32_t runningSampleIndex;
+	int secondaryBufferSize;
+	int toneVolume;
+};
 
 static bool globalRunningFlag;
-static offscreenBuffer globalBitmapBackbuffer;
+static OffscreenBuffer globalBitmapBackbuffer;
 static LPDIRECTSOUNDBUFFER globalSecondaryAudioBuffer;
 
-static void
-initDirectSound(HWND windowHandle, int32_t bufferSize, int32_t samplesPerSecond) // NOTE: I AM making it mandatory to have the library in order to run the program, handmade hero doesnt
+static void initDirectSound(HWND windowHandle, int32_t bufferSize, int32_t samplesPerSecond) // NOTE: I AM making it mandatory to have the library in order to run the program, handmade hero doesnt
 {
 	LPDIRECTSOUND directSound;
 
@@ -82,18 +95,18 @@ initDirectSound(HWND windowHandle, int32_t bufferSize, int32_t samplesPerSecond)
 		// TODO: Logging and error system
 	}
 }
-windowDimensions getWindowDimensions(HWND windowHandle)
+WindowDimensions getWindowDimensions(HWND windowHandle)
 {
 	RECT clientRect;
 	GetClientRect(windowHandle, &clientRect);
 
-	windowDimensions result;
+	WindowDimensions result;
 	result.height = clientRect.bottom - clientRect.top;
 	result.width = clientRect.right - clientRect.left;
 
 	return result;
 }
-static void render(offscreenBuffer *buffer, int blueOffset, int greenOffset)
+static void render(OffscreenBuffer *buffer, int blueOffset, int greenOffset)
 {
 	uint8_t *row = (uint8_t *)buffer->memory;
 	for (int y = 0; y < buffer->height; ++y)
@@ -109,7 +122,7 @@ static void render(offscreenBuffer *buffer, int blueOffset, int greenOffset)
 		row += buffer->pitch;
 	}
 }
-static void resizeDIBSection(offscreenBuffer *buffer, int width, int height)
+static void resizeDIBSection(OffscreenBuffer *buffer, int width, int height)
 {
 	// TODO: dont free automatically, maybe free after, then free first if that fails
 
@@ -135,7 +148,7 @@ static void resizeDIBSection(offscreenBuffer *buffer, int width, int height)
 
 	buffer->pitch = buffer->width * buffer->bytesPerPixel; // number of bytes in a row of the bitmap
 }
-static void displayBufferInWindow(HDC deviceContext, int width, int height, offscreenBuffer *buffer, int x, int y)
+static void displayBufferInWindow(HDC deviceContext, int width, int height, OffscreenBuffer *buffer, int x, int y)
 {
 	// TODO: aspect ratio correction
 	StretchDIBits(
@@ -220,7 +233,7 @@ LRESULT CALLBACK windowCallback(
 		PAINTSTRUCT paint;
 		HDC deviceContext = BeginPaint(windowHandle, &paint);
 
-		windowDimensions dimensions = getWindowDimensions(windowHandle);
+		WindowDimensions dimensions = getWindowDimensions(windowHandle);
 
 		int x = paint.rcPaint.left;
 		int y = paint.rcPaint.top;
@@ -260,6 +273,58 @@ LRESULT CALLBACK windowCallback(
 	return result;
 };
 
+static void fillSoundBuffer(SoundOutput *soundOutput, DWORD byteToLock, DWORD bytesToWrite)
+{
+	void *region1;
+	DWORD region1Size;
+	void *region2;
+	DWORD region2Size;
+
+	HRESULT lockResult = globalSecondaryAudioBuffer->Lock(byteToLock, bytesToWrite,
+														  &region1, &region1Size,
+														  &region2, &region2Size,
+														  0);
+
+	if (SUCCEEDED(lockResult))
+	{
+		OutputDebugStringA("Lock worked\n");
+
+		DWORD region1SampleCount = region1Size / soundOutput->bytesPerSample;
+		int16_t *sampleOut = (int16_t *)region1;
+
+		for (DWORD sampleIndex = 0; sampleIndex < region1SampleCount; ++sampleIndex)
+		{
+			float position = 2.0f * pi32 * (float)soundOutput->runningSampleIndex / (float)soundOutput->wavePeriod;
+			float sineValue = sinf(position);									  // returns a number between 1 and -1
+			int16_t sampleValue = (int16_t)(sineValue * soundOutput->toneVolume); // scales the sine up to the volume
+			*sampleOut++ = sampleValue;
+			*sampleOut++ = sampleValue;
+
+			++soundOutput->runningSampleIndex;
+		}
+		sampleOut = (int16_t *)region2;
+		DWORD region2SampleCount = region2Size / soundOutput->bytesPerSample;
+
+		for (DWORD sampleIndex = 0; sampleIndex < region2SampleCount; ++sampleIndex)
+		{
+			float position = 2.0f * pi32 * (float)soundOutput->runningSampleIndex / (float)soundOutput->wavePeriod;
+			float sineValue = sinf(position);
+			int16_t sampleValue = (int16_t)(sineValue * soundOutput->toneVolume);
+			*sampleOut++ = sampleValue;
+			*sampleOut++ = sampleValue;
+
+			++soundOutput->runningSampleIndex;
+		}
+		globalSecondaryAudioBuffer->Unlock(region1, region1Size, region2, region2Size);
+	}
+	else
+	{
+		OutputDebugStringA("Lock failed with HRESULT: ");
+		OutputDebugStringA(std::to_string(lockResult).c_str());
+		OutputDebugStringA("\n");
+	}
+}
+
 int CALLBACK WinMain(
 	HINSTANCE instance,
 	HINSTANCE prevInstance,
@@ -298,20 +363,23 @@ int CALLBACK WinMain(
 			int xOffset = 0;
 			int yOffset = 0;
 
-			int samplesPerSecond = 48000;
-			int toneHz = 256;
-			int squareWavePeriod = samplesPerSecond / toneHz;
-			int bytesPerSample = sizeof(int16_t) * 2;
-			uint32_t runningSampleIndex = 0;
-			int halfWaveSquarePeriod = squareWavePeriod / 2;
-			int secondaryBufferSize = samplesPerSecond * bytesPerSample;
-			int toneVolume = 500;
+			SoundOutput soundOutput = {};
+			soundOutput.samplesPerSecond = 48000;
+			soundOutput.toneHz = 256;
+			soundOutput.toneVolume = 3000;
+			soundOutput.runningSampleIndex = 0;
+			soundOutput.wavePeriod = soundOutput.samplesPerSecond / soundOutput.toneHz;
+			soundOutput.bytesPerSample = sizeof(int16_t) * 2;
+			soundOutput.secondaryBufferSize = soundOutput.samplesPerSecond * soundOutput.bytesPerSample;
 
-			initDirectSound(windowHandle, samplesPerSecond, samplesPerSecond * (sizeof(int16_t) * 2));
+			initDirectSound(windowHandle, soundOutput.secondaryBufferSize, soundOutput.samplesPerSecond);
+
+			fillSoundBuffer(&soundOutput, 0, soundOutput.secondaryBufferSize);
 
 			globalSecondaryAudioBuffer->Play(0, 0, DSBPLAY_LOOPING);
 
 			globalRunningFlag = true;
+
 			while (globalRunningFlag)
 			{
 				MSG message;
@@ -333,72 +401,31 @@ int CALLBACK WinMain(
 
 				if (SUCCEEDED(globalSecondaryAudioBuffer->GetCurrentPosition(&playCursor, &writeCursor)))
 				{
+					DWORD byteToLock = ((soundOutput.runningSampleIndex * soundOutput.bytesPerSample) %
+										soundOutput.secondaryBufferSize);
 					DWORD bytesToWrite;
-					DWORD byteToLock = runningSampleIndex * bytesPerSample % secondaryBufferSize;
+
 					if (byteToLock == playCursor)
 					{
-						bytesToWrite = secondaryBufferSize;
+						bytesToWrite = 0;
 					}
-					if (byteToLock > playCursor)
+					else if (byteToLock > playCursor)
 					{
-						bytesToWrite = secondaryBufferSize - byteToLock;
+						bytesToWrite = (soundOutput.secondaryBufferSize - byteToLock);
 						bytesToWrite += playCursor;
 					}
 					else
 					{
 						bytesToWrite = playCursor - byteToLock;
 					}
-
-					void *region1;
-					DWORD region1Size;
-					void *region2;
-					DWORD region2Size;
-
-					HRESULT lockResult = globalSecondaryAudioBuffer->Lock(byteToLock, bytesToWrite,
-																		  &region1, &region1Size,
-																		  &region2, &region2Size,
-																		  0);
-					if (SUCCEEDED(lockResult))
-					{
-
-						int16_t *sampleOut = (int16_t *)region1;
-						DWORD region1SampleCount = region1Size / bytesPerSample;
-
-						for (DWORD sampleIndex = 0; sampleIndex < region1SampleCount; ++sampleIndex)
-						{
-							int16_t sampleValue = ((runningSampleIndex / halfWaveSquarePeriod) % 2) ? toneVolume : -toneVolume;
-							*sampleOut++ = sampleValue;
-							*sampleOut++ = sampleValue;
-							++runningSampleIndex;
-						}
-						sampleOut = (int16_t *)region2;
-						DWORD region2SampleCount = region2Size / bytesPerSample;
-
-						for (DWORD sampleIndex = 0; sampleIndex < region2SampleCount; ++sampleIndex)
-						{
-							int16_t sampleValue = ((runningSampleIndex / halfWaveSquarePeriod) % 2) ? toneVolume : -toneVolume;
-							*sampleOut++ = sampleValue;
-							*sampleOut++ = sampleValue;
-							++runningSampleIndex;
-						}
-						globalSecondaryAudioBuffer->Unlock(region1, region1Size, region2, region2Size);
-					}
-					else
-					{
-						OutputDebugStringA("Lock failed with HRESULT: ");
-						OutputDebugStringA(std::to_string(lockResult).c_str());
-						OutputDebugStringA("\n");
-					}
+					fillSoundBuffer(&soundOutput, byteToLock, bytesToWrite);
 				}
 				else
 				{
 					OutputDebugStringA("GetCurrentPosition failed\n");
 				}
-
-				windowDimensions dimensions = getWindowDimensions(windowHandle);
+				WindowDimensions dimensions = getWindowDimensions(windowHandle);
 				displayBufferInWindow(deviceContext, dimensions.width, dimensions.height, &globalBitmapBackbuffer, 0, 0);
-
-				ReleaseDC(windowHandle, deviceContext);
 
 				++xOffset;
 			}
@@ -412,6 +439,5 @@ int CALLBACK WinMain(
 	{
 		// TODO: Logging and error system
 	}
-
 	return 0;
 }
